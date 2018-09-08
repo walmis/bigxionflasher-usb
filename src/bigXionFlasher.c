@@ -56,19 +56,14 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <time.h>
-#ifdef __WIN32__
- #include <conio.h>
- #define DEVICE_OPEN NULL
- #define TREIBER_NAME "mhstcan.dll"
- #define _NL "\n\r"
- #define _DEGREE_SIGN "o"
-#else
- #define DEVICE_OPEN NULL
- #define TREIBER_NAME "libmhstcan.so"
- #define _NL "\n"
- #define _DEGREE_SIGN "°"
-#endif
-#include "can_drv.h"
+#include <linux/can.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <sys/types.h>
+#include <net/if.h>
+#include <assert.h>
+#include <sys/poll.h>
+
 
 #define __DOSTR(v) #v
 #define __STR(v) __DOSTR(v)
@@ -84,10 +79,15 @@
 #define TIMEOUT_VALUE					80
 #define TIMEOUT_US						10000 // 10ms
 
+#define _NL "\n"
+#define _DEGREE_SIGN "*"
 #define doSleep(x) usleep(x*1000)
 
 int gAssistInitLevel = -1, gPrintSystemSettings = 0, gSkipShutdown = 0, gPowerOff = 0, gConsoleSetSlaveMode = 1, gNoSerialNumbers = 0, gSetMountainCap = -1, gSetWheelCircumference = 0;
 double gSetSpeedLimit = -1, gSetMinSpeedLimit = -1, gSetThrottleSpeedLimit = -1;
+
+int can_fd;
+char* can_if = "can0";
 
 char *getNodeName(unsigned char id)
 {
@@ -105,68 +105,53 @@ char *getNodeName(unsigned char id)
 
 void setValue(unsigned char receipient, unsigned char reg, unsigned char value)
 {
-	struct TCanMsg msg;
-	int timeout = TIMEOUT_VALUE;
+	struct can_frame msg;
+	int res;
 
-	msg.MsgFlags = 0L;
-	msg.Id = receipient;
-	msg.MsgLen = 4;
-	msg.MsgData[0] = 0x00;
-	msg.MsgData[1] = reg;
-	msg.MsgData[2] = 0x00;
-	msg.MsgData[3] = value;
+	msg.can_id = receipient;
+	msg.can_dlc = 4;
+	msg.data[0] = 0x00;
+	msg.data[1] = reg;
+	msg.data[2] = 0x00;
+	msg.data[3] = value;
 
-	CanTransmit(0, &msg, 1);
-
-	while(timeout-- && CanTransmitGetCount(0))
-		usleep(TIMEOUT_US);
-
-	if (timeout == -1)
-		printf("error: could not send value to %s" _NL, getNodeName(receipient));
+	res = write(can_fd, &msg, sizeof(msg));
+	assert(res > 0);
 }
 
 unsigned int getValue(unsigned char receipient, unsigned char reg)
 {
-	struct TCanMsg msg;
+	struct can_frame msg;
 	int err, retry = 20;
-	int timeout = TIMEOUT_VALUE;
-	
-	msg.MsgFlags = 0L;
-	msg.Id = receipient;
-	msg.MsgLen = 2;
-	msg.MsgData[0] = 0x00;
-	msg.MsgData[1] = reg;
+	struct pollfd pfd;
 
-	CanTransmit(0, &msg, 1);
+	msg.can_id = receipient;
+	msg.can_dlc = 2;
+	msg.data[0] = 0x00;
+	msg.data[1] = reg;
 
-	while(timeout-- && CanTransmitGetCount(0))
-		usleep(TIMEOUT_US);
-
-	if (timeout == -1)
-		printf("error: could not send value to node %s" _NL, getNodeName(receipient));
+	err = write(can_fd, (void*)&msg, sizeof(msg));
 
 retry:
-	timeout = TIMEOUT_VALUE;
-	while(timeout-- && !CanReceiveGetCount(0))
-		usleep(TIMEOUT_US);
+	pfd.fd = can_fd;
+	pfd.events = POLLIN;
 
-	if (timeout == -1) {
-		printf("error: no response from node %s" _NL, getNodeName(receipient));
-		return 0;
-	}
-
-	if ((err = CanReceive(0, &msg, 1)) > 0) {
-		if (--retry && (msg.Id != BIB || msg.MsgLen != 4 || msg.MsgData[1] != reg))
-			goto retry;
-
-		if (!retry) {
-			printf("error: no response from node %s to %s" _NL, getNodeName(receipient), getNodeName(BIB));
-			return 0;
+	while(retry-- > 0) {
+		//printf("poll\n");
+		err = poll(&pfd, 1, 10);
+		if(err > 0) {
+			err = read(can_fd, &msg, sizeof(msg));
+			if(msg.can_id != BIB || msg.can_dlc != 4 || msg.data[1] != reg) {
+				continue;
+			}
+			return (unsigned int) msg.data[3];
 		}
 
-		return (unsigned int) msg.MsgData[3];
-	} else
-		printf("Error: %d" _NL, err);
+	}
+	if (!retry) {
+		printf("error: no response from node %s to %s" _NL, getNodeName(receipient), getNodeName(BIB));
+		return 0;
+	}
 
 	return 0;
 }
@@ -261,6 +246,7 @@ double getVoltageValue(unsigned char in, unsigned char reg)
 
 void usage(void) {
 	printf( "usage:" _NL
+			" -I <interface> ........... CAN interface (default can0)" _NL
 			" -l <speedLimit> .......... set the speed limit to <speedLimit> (1 - " __STR(UNLIMITED_SPEED_VALUE) "), 0 = remove the limit" _NL
 			" -m <minSpeedLimit> ....... set the minimum speed limit to <minSpeedLimit> (0 - " __STR(UNLIMITED_MIN_SPEED_VALUE) "), 0 = remove the limit" _NL
 			" -t <throttleSpeedLimit> .. set the throttle speed limit to <throttleSpeedLimit> (0 - " __STR(MAX_THROTTLE_SPEED_VALUE) "), 0 = remove the limit" _NL
@@ -278,7 +264,7 @@ void usage(void) {
 int parseOptions(int argc, char **argv)
 {
 	int oc;
-	char odef[] = "l:t:m:sa:pnxio:c:h?";
+	char odef[] = "I:l:t:m:sa:pnxio:c:h?";
 
 	while((oc = getopt(argc,argv,odef)) != -1) {
 		switch(oc) {
@@ -287,6 +273,9 @@ int parseOptions(int argc, char **argv)
 				break;
 			case 'x':
 				gSkipShutdown = 1;
+				break;
+			case 'I':
+				can_if = optarg;
 				break;
 			case 'l':
 				gSetSpeedLimit = atof(optarg);
@@ -506,50 +495,41 @@ void printSystemSettings()
 int main(int argc, char **argv)
 {
 	int err, doShutdown = 0, consoleInSlaveMode = 0;
-	struct TDeviceStatus status;
+	setbuf(stdout, NULL);
 
-	printf("BigXionFlasher USB " __BXF_VERSION__ _NL " (c) 2011-2013 by Thomas Koenig <info@bigxionflasher.org> - www.bigxionflasher.org"_NL _NL);
-
+	printf("BigXionFlasher USB " __BXF_VERSION__ _NL " (c) 2011-2013 by Thomas Koenig <info@bigxionflasher.org> - www.bigxionflasher.org"_NL);
+	printf(" (c) 2018 SocketCAN support added by Walmis <walmis@ensys.lt>" _NL  _NL);
 	if ((err=parseOptions(argc, argv) < 0))
 		exit(1);
 
-	if ((err = LoadDriver(TREIBER_NAME)) < 0) {
-		printf("LoadDriver error: %d" _NL, err);
-		goto error;
-	}
+     struct sockaddr_can addr;
+     struct ifreq ifr;
+	 can_fd = socket(PF_CAN, SOCK_RAW, CAN_RAW);
+	 strcpy(ifr.ifr_name, can_if );
+	 ioctl(can_fd, SIOCGIFINDEX, &ifr);
 
-	if ((err = CanInitDriver(NULL)) < 0) {
-		printf("CanInitDriver error: %d" _NL, err);
-		goto error;
-	}
+	 printf("Opening %s...", can_if);
 
-	if ((err = CanDeviceOpen(0, DEVICE_OPEN)) < 0) {
-		printf("CanDeviceOpen error: %d" _NL, err);
-		goto error;
-	}
+	 addr.can_family = AF_CAN;
+	 addr.can_ifindex = ifr.ifr_ifindex;
 
-	CanSetSpeed(0, CAN_125K_BIT);
-	CanSetMode(0, OP_CAN_START, CAN_CMD_ALL_CLEAR);
-	CanGetDeviceStatus(0, &status);
+	 err = bind(can_fd, (struct sockaddr *)&addr, sizeof(addr));
+	 if(err < 0) {
+		 printf(_NL);
+		 perror("CAN Failed");
+		 exit(1);
+	 }
+	 printf("OK" _NL);
 
-	if (status.DrvStatus >= DRV_STATUS_CAN_OPEN) {
-		if (status.CanStatus == CAN_STATUS_BUS_OFF) {
-			printf("CAN Status BusOff" _NL);
-			CanSetMode(0, OP_CAN_RESET, CAN_CMD_NONE);
-		}
-	} else {
-		printf("error: could not open device" _NL);
-		goto error;
-	}
 
 	consoleInSlaveMode = getValue(CONSOLE, CONSOLE_STATUS_SLAVE);
 	if (consoleInSlaveMode) {
-		printf("console already in salve mode. good!" _NL _NL);
+		printf("console already in slave mode. good!" _NL _NL);
 	} else {
 		if (gConsoleSetSlaveMode) {
 			int retry = 20;
 
-			printf("putting console in salve mode ... ");
+			printf("putting console in slave mode ... ");
 			do {
 				setValue(CONSOLE, CONSOLE_STATUS_SLAVE, 1);
 				consoleInSlaveMode = getValue(CONSOLE, CONSOLE_STATUS_SLAVE);
@@ -616,14 +596,11 @@ int main(int argc, char **argv)
 		setValue(BATTERY, BATTERY_CONFIG_SHUTDOWN, 1);
 	}
 
-	CanDownDriver();
-	UnloadDriver();
 
 	return 0;
 
 error:
-	CanDownDriver();
-	UnloadDriver();
+
 
 	return 1;
 
